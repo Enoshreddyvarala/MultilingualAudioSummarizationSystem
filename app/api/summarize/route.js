@@ -1,45 +1,110 @@
 /**
  * MLYTAS Pipeline Orchestrator — Vercel API Route
- * Receives a YouTube URL, calls HF Space 1 (ASR) then HF Space 2 (Summarizer),
- * and streams results back to the client as Server-Sent Events.
+ * Receives an audio file, calls HF Space 1 (ASR) then HF Space 2 (Summarizer)
+ * using the Gradio 5 Queue/SSE protocol, and streams results back to the client.
  */
 
 const ASR_URL = process.env.HF_SPACE_ASR_URL;
 const SUMMARIZER_URL = process.env.HF_SPACE_SUMMARIZER_URL;
+const HF_TOKEN = process.env.HF_TOKEN;
 
 function sseEvent(type, data) {
   return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
 /**
- * Call a Gradio Space's /api/predict endpoint.
+ * Call a Gradio 5 Space's Queue-based API endpoint.
+ * Joins the queue, streams events from the SSE endpoint, and returns the final completed data.
  */
-async function callGradio(baseUrl, inputs, apiName, timeoutMs = 300_000, returnFullData = false) {
-  const endpoint = `${baseUrl}/api/predict`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+async function callGradioQueue(baseUrl, apiName, dataArray, timeoutMs = 300_000) {
+  const joinUrl = `${baseUrl}/gradio_api/call/${apiName}`;
+  const headers = { 'Content-Type': 'application/json' };
+  if (HF_TOKEN) {
+    headers['Authorization'] = `Bearer ${HF_TOKEN}`;
+  }
+
+  // 1. Join the queue
+  const joinRes = await fetch(joinUrl, {
+    method: 'POST',
+    headers: headers,
+    body: JSON.stringify({ data: dataArray }),
+  });
+
+  if (!joinRes.ok) {
+    const text = await joinRes.text().catch(() => '');
+    throw new Error(`Failed to join queue: ${joinRes.status} ${text.slice(0, 200)}`);
+  }
+
+  const joinJson = await joinRes.json();
+  const eventId = joinJson.event_id;
+  if (!eventId) {
+    throw new Error(`Queue did not return an event ID.`);
+  }
+
+  // 2. Stream results from the queue until complete
+  const dataUrl = `${baseUrl}/gradio_api/call/${apiName}/${eventId}`;
+  const dataHeaders = {};
+  if (HF_TOKEN) {
+    dataHeaders['Authorization'] = `Bearer ${HF_TOKEN}`;
+  }
+
+  const streamRes = await fetch(dataUrl, {
+    headers: dataHeaders,
+  });
+
+  if (!streamRes.ok) {
+    throw new Error(`Failed to establish event stream: ${streamRes.status}`);
+  }
+
+  if (!streamRes.body) {
+    throw new Error('No stream body returned from Gradio event stream.');
+  }
+
+  const reader = streamRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
 
   try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      // api_name handles correct routing in newer Gradio versions
-      body: JSON.stringify({ data: inputs, api_name: `/${apiName}` }),
-      signal: controller.signal,
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`HF Space responded ${res.status}: ${text.slice(0, 200)}`);
-    }
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
 
-    const json = await res.json();
-    if (returnFullData) {
-      return json.data;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+
+        const linesOfBlock = line.split('\n');
+        let eventType = '';
+        let dataStr = '';
+
+        for (const l of linesOfBlock) {
+          if (l.startsWith('event:')) {
+            eventType = l.substring(6).trim();
+          } else if (l.startsWith('data:')) {
+            dataStr = l.substring(5).trim();
+          }
+        }
+
+        if (eventType === 'complete') {
+          clearTimeout(timer);
+          const parsedData = JSON.parse(dataStr);
+          return parsedData;
+        } else if (eventType === 'error') {
+          clearTimeout(timer);
+          throw new Error(`Gradio queue error: ${dataStr}`);
+        }
+      }
     }
-    return json.data?.[0] ?? json.data;
-  } finally {
     clearTimeout(timer);
+    throw new Error('Queue stream ended before completion.');
+  } finally {
+    reader.cancel();
   }
 }
 
@@ -85,9 +150,16 @@ export async function POST(request) {
         const uploadData = new FormData();
         uploadData.append('files', file);
 
-        const uploadRes = await fetch(`${ASR_URL}/upload`, {
+        const uploadHeaders = {};
+        if (HF_TOKEN) {
+          uploadHeaders['Authorization'] = `Bearer ${HF_TOKEN}`;
+        }
+
+        // Gradio 5 uploads live under /gradio_api/upload prefix
+        const uploadRes = await fetch(`${ASR_URL}/gradio_api/upload`, {
           method: 'POST',
           body: uploadData,
+          headers: uploadHeaders,
         });
 
         if (!uploadRes.ok) {
@@ -95,7 +167,6 @@ export async function POST(request) {
         }
         
         const uploadJson = await uploadRes.json();
-        // Gradio 4/5 returns an array of file objects
         const uploadedFileMeta = uploadJson[0]; 
         
         // Prepare the FileData dictionary for the predict endpoint
@@ -110,8 +181,7 @@ export async function POST(request) {
 
         let transcript;
         try {
-          // ASR returns a tuple of [formatted_text, metadata_dict] so we request full data
-          const raw = await callGradio(ASR_URL, [fileInput], 'transcribe', 1_200_000, true);
+          const raw = await callGradioQueue(ASR_URL, 'transcribe', [fileInput], 1_200_000);
           
           if (!raw || !Array.isArray(raw)) {
             throw new Error('Invalid response structure from ASR service.');
@@ -143,8 +213,15 @@ export async function POST(request) {
         let analysis;
         try {
           const transcriptStr = JSON.stringify(transcript);
-          const raw = await callGradio(SUMMARIZER_URL, [transcriptStr, lang], 'summarize', 180_000);
-          analysis = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          const raw = await callGradioQueue(SUMMARIZER_URL, 'summarize', [transcriptStr, lang], 180_000);
+          
+          let analysisRaw = raw?.[0];
+          if (typeof analysisRaw === 'string') {
+            analysis = JSON.parse(analysisRaw);
+          } else {
+            analysis = analysisRaw;
+          }
+
           if (analysis?.error) throw new Error(analysis.error);
         } catch (err) {
           send('error', { message: `Summarization failed: ${err.message}` });
