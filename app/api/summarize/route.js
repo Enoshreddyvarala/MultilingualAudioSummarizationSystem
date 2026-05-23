@@ -14,7 +14,7 @@ function sseEvent(type, data) {
 /**
  * Call a Gradio Space's /api/predict endpoint.
  */
-async function callGradio(baseUrl, inputs, apiName, timeoutMs = 300_000) {
+async function callGradio(baseUrl, inputs, apiName, timeoutMs = 300_000, returnFullData = false) {
   const endpoint = `${baseUrl}/api/predict`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -34,6 +34,9 @@ async function callGradio(baseUrl, inputs, apiName, timeoutMs = 300_000) {
     }
 
     const json = await res.json();
+    if (returnFullData) {
+      return json.data;
+    }
     return json.data?.[0] ?? json.data;
   } finally {
     clearTimeout(timer);
@@ -107,9 +110,26 @@ export async function POST(request) {
 
         let transcript;
         try {
-          const raw = await callGradio(ASR_URL, [fileInput], 'transcribe', 1_200_000);
-          transcript = typeof raw === 'string' ? JSON.parse(raw) : raw;
-          if (transcript?.error) throw new Error(transcript.error);
+          // ASR returns a tuple of [formatted_text, metadata_dict] so we request full data
+          const raw = await callGradio(ASR_URL, [fileInput], 'transcribe', 1_200_000, true);
+          
+          if (!raw || !Array.isArray(raw)) {
+            throw new Error('Invalid response structure from ASR service.');
+          }
+
+          const transcriptText = raw[0];
+          const metadata = raw[1] || {};
+
+          if (!transcriptText) {
+            throw new Error('No transcription returned from ASR service.');
+          }
+
+          transcript = {
+            text: transcriptText,
+            language: metadata.language || '',
+            duration: metadata.duration || 0,
+            segments: metadata.segments_list || []
+          };
         } catch (err) {
           send('error', { message: `Transcription failed: ${err.message}` });
           send('done', {});
@@ -122,7 +142,7 @@ export async function POST(request) {
         // ── Step 3: Summarization ────────────────────────────────────────
         let analysis;
         try {
-          const transcriptStr = typeof transcript === 'string' ? transcript : JSON.stringify(transcript);
+          const transcriptStr = JSON.stringify(transcript);
           const raw = await callGradio(SUMMARIZER_URL, [transcriptStr, lang], 'summarize', 180_000);
           analysis = typeof raw === 'string' ? JSON.parse(raw) : raw;
           if (analysis?.error) throw new Error(analysis.error);
