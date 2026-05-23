@@ -4,6 +4,9 @@
  * using the Gradio 5 Queue/SSE protocol, and streams results back to the client.
  */
 
+export const maxDuration = 300; // 5 minutes max duration for Vercel
+export const dynamic = 'force-dynamic';
+
 const ASR_URL = process.env.HF_SPACE_ASR_URL;
 const SUMMARIZER_URL = process.env.HF_SPACE_SUMMARIZER_URL;
 const HF_TOKEN = process.env.HF_TOKEN;
@@ -23,11 +26,13 @@ async function callGradioQueue(baseUrl, apiName, dataArray, timeoutMs = 300_000)
     headers['Authorization'] = `Bearer ${HF_TOKEN}`;
   }
 
+  const sessionHash = Math.random().toString(36).substring(2, 10);
+  
   // 1. Join the queue
   const joinRes = await fetch(joinUrl, {
     method: 'POST',
     headers: headers,
-    body: JSON.stringify({ data: dataArray }),
+    body: JSON.stringify({ data: dataArray, session_hash: sessionHash }),
   });
 
   if (!joinRes.ok) {
