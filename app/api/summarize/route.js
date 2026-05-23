@@ -170,9 +170,18 @@ export async function POST(request) {
         const uploadedFileMeta = uploadJson[0]; 
         
         // Prepare the FileData dictionary for the predict endpoint
+        let uploadedPath = "";
+        let origName = file.name || "audio.wav";
+        if (typeof uploadedFileMeta === "string") {
+            uploadedPath = uploadedFileMeta;
+        } else if (uploadedFileMeta && typeof uploadedFileMeta === "object") {
+            uploadedPath = uploadedFileMeta.path || uploadedFileMeta.name || "";
+            origName = uploadedFileMeta.orig_name || origName;
+        }
+
         const fileInput = {
-          path: uploadedFileMeta.path || uploadedFileMeta.name,
-          orig_name: uploadedFileMeta.orig_name,
+          path: uploadedPath,
+          orig_name: origName,
           meta: { _type: "gradio.FileData" }
         };
 
