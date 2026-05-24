@@ -149,6 +149,13 @@ function renderContent(name, content, isStreaming) {
   if (content === undefined || content === null) return null;
 
   switch (name) {
+    case 'transcript':
+      return (
+        <TextContent
+          text={typeof content === 'string' ? content : content.text ?? JSON.stringify(content, null, 2)}
+          isStreaming={isStreaming}
+        />
+      );
     case 'topics':
       return <TopicsContent data={content} isStreaming={isStreaming} />;
     case 'speaker_insights':
