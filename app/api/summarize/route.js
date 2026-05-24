@@ -4,7 +4,7 @@
  * using the Gradio 5 Queue/SSE protocol, and streams results back to the client.
  */
 
-import { Client } from '@gradio/client';
+import { Client } from '@gradio/client/dist/index.js';
 
 export const maxDuration = 300; // 5 minutes max duration for Vercel
 export const dynamic = 'force-dynamic';
