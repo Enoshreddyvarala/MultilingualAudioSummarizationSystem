@@ -4,8 +4,6 @@
  * using the Gradio 5 Queue/SSE protocol, and streams results back to the client.
  */
 
-import { Client } from '@gradio/client/dist/index.js';
-
 export const maxDuration = 300; // 5 minutes max duration for Vercel
 export const dynamic = 'force-dynamic';
 
@@ -17,52 +15,102 @@ function sseEvent(type, data) {
   return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+/**
+ * Call a Gradio 5 Space's Queue-based API endpoint.
+ * Joins the queue, streams events from the SSE endpoint, and returns the final completed data.
+ */
 async function callGradioQueue(baseUrl, apiName, dataArray, timeoutMs = 300_000) {
-  const client = await Client.connect(baseUrl, {
-    token: HF_TOKEN,
-    events: ['data', 'status']
+  const joinUrl = `${baseUrl}/gradio_api/call/${apiName}`;
+  const headers = { 'Content-Type': 'application/json' };
+  if (HF_TOKEN) {
+    headers['Authorization'] = `Bearer ${HF_TOKEN}`;
+  }
+
+  const sessionHash = Math.random().toString(36).substring(2, 10);
+  
+  // 1. Join the queue
+  const joinRes = await fetch(joinUrl, {
+    method: 'POST',
+    headers: headers,
+    body: JSON.stringify({ data: dataArray, session_hash: sessionHash }),
   });
 
-  const submission = client.submit(`/${apiName}`, dataArray);
-  let lastData = null;
-  let lastError = null;
-  let done = false;
+  if (!joinRes.ok) {
+    const text = await joinRes.text().catch(() => '');
+    throw new Error(`Failed to join queue: ${joinRes.status} ${text.slice(0, 200)}`);
+  }
 
-  const timeout = setTimeout(async () => {
-    if (submission.cancel) {
-      await submission.cancel();
-    }
-  }, timeoutMs);
+  const joinJson = await joinRes.json();
+  const eventId = joinJson.event_id;
+  if (!eventId) {
+    throw new Error(`Queue did not return an event ID.`);
+  }
+
+  // 2. Stream results from the queue until complete
+  const dataUrl = `${baseUrl}/gradio_api/call/${apiName}/${eventId}`;
+  const dataHeaders = {};
+  if (HF_TOKEN) {
+    dataHeaders['Authorization'] = `Bearer ${HF_TOKEN}`;
+  }
+
+  const streamRes = await fetch(dataUrl, {
+    headers: dataHeaders,
+  });
+
+  if (!streamRes.ok) {
+    throw new Error(`Failed to establish event stream: ${streamRes.status}`);
+  }
+
+  if (!streamRes.body) {
+    throw new Error('No stream body returned from Gradio event stream.');
+  }
+
+  const reader = streamRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
 
   try {
-    for await (const msg of submission) {
-      if (msg.type === 'data') {
-        lastData = msg.data;
-      }
-      if (msg.type === 'status' && msg.stage === 'error') {
-        lastError = Array.isArray(msg.message)
-          ? msg.message.map((item) => item?.message ?? item).join(' ')
-          : msg.message || 'Gradio reported an error.';
-      }
-      if (msg.type === 'status' && msg.stage === 'complete') {
-        done = true;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+
+        const linesOfBlock = line.split('\n');
+        let eventType = '';
+        let dataStr = '';
+
+        for (const l of linesOfBlock) {
+          if (l.startsWith('event:')) {
+            eventType = l.substring(6).trim();
+          } else if (l.startsWith('data:')) {
+            dataStr = l.substring(5).trim();
+          }
+        }
+
+        if (eventType === 'complete') {
+          clearTimeout(timer);
+          const parsedData = JSON.parse(dataStr);
+          return parsedData;
+        } else if (eventType === 'error') {
+          clearTimeout(timer);
+          throw new Error(`Gradio queue error: ${dataStr}`);
+        }
       }
     }
+    clearTimeout(timer);
+    throw new Error('Queue stream ended before completion.');
   } finally {
-    clearTimeout(timeout);
+    reader.cancel();
   }
-
-  if (lastError) {
-    throw new Error(lastError);
-  }
-  if (!done) {
-    throw new Error('Gradio request did not complete successfully.');
-  }
-  if (lastData === null) {
-    throw new Error('No data returned from Gradio endpoint.');
-  }
-
-  return lastData;
 }
 
 export async function POST(request) {
@@ -101,15 +149,53 @@ export async function POST(request) {
       }
 
       try {
-        // ── Step 1: Prepare ASR request ────────────────────────────────────
+        // ── Step 1: Upload to Gradio ──────────────────────────────────────
         send('stage', { stage: 'uploading' });
+
+        const uploadData = new FormData();
+        uploadData.append('files', file);
+
+        const uploadHeaders = {};
+        if (HF_TOKEN) {
+          uploadHeaders['Authorization'] = `Bearer ${HF_TOKEN}`;
+        }
+
+        // Gradio 5 uploads live under /gradio_api/upload prefix
+        const uploadRes = await fetch(`${ASR_URL}/gradio_api/upload`, {
+          method: 'POST',
+          body: uploadData,
+          headers: uploadHeaders,
+        });
+
+        if (!uploadRes.ok) {
+          throw new Error(`File upload failed with status ${uploadRes.status}`);
+        }
+        
+        const uploadJson = await uploadRes.json();
+        const uploadedFileMeta = uploadJson[0]; 
+        
+        // Prepare the FileData dictionary for the predict endpoint
+        let uploadedPath = "";
+        let origName = file.name || "audio.wav";
+        if (typeof uploadedFileMeta === "string") {
+            uploadedPath = uploadedFileMeta;
+        } else if (uploadedFileMeta && typeof uploadedFileMeta === "object") {
+            uploadedPath = uploadedFileMeta.path || uploadedFileMeta.name || "";
+            origName = uploadedFileMeta.orig_name || origName;
+        }
+
+        const fileInput = {
+          path: uploadedPath,
+          orig_name: origName,
+          meta: { _type: "gradio.FileData" }
+        };
 
         // ── Step 2: ASR ──────────────────────────────────────────────────
         send('stage', { stage: 'transcribing' });
 
         let transcript;
         try {
-          const raw = await callGradioQueue(ASR_URL, 'transcribe', [file], 1_200_000);
+          const raw = await callGradioQueue(ASR_URL, 'transcribe', [fileInput], 1_200_000);
           
           if (!raw || !Array.isArray(raw)) {
             throw new Error('Invalid response structure from ASR service.');
