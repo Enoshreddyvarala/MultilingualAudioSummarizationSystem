@@ -214,6 +214,12 @@ export async function POST(request) {
             duration: metadata.duration || 0,
             segments: metadata.segments_list || []
           };
+          // Emit the raw transcript to the client so the UI can show it
+          try {
+            send('section', { name: 'transcript', content: transcript });
+          } catch (err) {
+            // ignore send errors here; continue to summarization
+          }
         } catch (err) {
           send('error', { message: `Transcription failed: ${err.message}` });
           send('done', {});
